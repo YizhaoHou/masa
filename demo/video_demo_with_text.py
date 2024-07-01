@@ -3,13 +3,13 @@ import sys
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
-
+import numpy as np
 import gc
 import resource
 import argparse
 import cv2
 import tqdm
-
+from utils import remove_outlier
 import torch
 from torch.multiprocessing import Pool, set_start_method
 
@@ -27,12 +27,18 @@ from utils import filter_and_update_tracks
 
 import warnings
 warnings.filterwarnings('ignore')
+import time
+
+module_path = '/home/nfs-share/docker_sim/workspace/project/vision_module'
+sys.path.append(module_path)
+from measure_3d import Measure_3D
 
 # Ensure the right start method for multiprocessing
 try:
     set_start_method('spawn')
 except RuntimeError:
     pass
+
 
 def set_file_descriptor_limit(limit):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -41,7 +47,7 @@ def set_file_descriptor_limit(limit):
 # Set the file descriptor limit to 65536
 set_file_descriptor_limit(65536)
 
-def visualize_frame(args, visualizer, frame, track_result, frame_idx, fps=None):
+def visualize_frame(args, visualizer, frame, track_result, frame_idx, fps=None, process = []):
     visualizer.add_datasample(
         name='video_' + str(frame_idx),
         image=frame[:, :, ::-1],
@@ -53,6 +59,9 @@ def visualize_frame(args, visualizer, frame, track_result, frame_idx, fps=None):
         fps=fps,)
     frame = visualizer.get_image()
     gc.collect()
+    
+        
+
     return frame
 
 def parse_args():
@@ -64,7 +73,7 @@ def parse_args():
     parser.add_argument('--det_checkpoint', help='Detector Checkpoint file')
     parser.add_argument('--masa_checkpoint', help='Masa Checkpoint file')
     parser.add_argument( '--device', default='cuda:0', help='Device used for inference')
-    parser.add_argument('--score-thr', type=float, default=0.2, help='Bbox score threshold')
+    parser.add_argument('--score-thr', type=float, default=0.8, help='Bbox score threshold')
     parser.add_argument('--out', type=str, help='Output video file')
     parser.add_argument('--save_dir', type=str, help='Output for video frames')
     parser.add_argument('--texts', help='text prompt')
@@ -86,6 +95,8 @@ def parse_args():
     return args
 
 def main():
+    detected = {}
+    predetected = {}
     args = parse_args()
     assert args.out, \
         ('Please specify at least one operation (save the '
@@ -130,6 +141,8 @@ def main():
         masa_model.cfg.visualizer['alpha'] = 0.5
     visualizer = VISUALIZERS.build(masa_model.cfg.visualizer)
 
+
+
     if args.out:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(
@@ -140,7 +153,14 @@ def main():
     instances_list = []
     frames = []
     fps_list = []
-    for frame in track_iter_progress((video_reader, len(video_reader))):
+    m3d = Measure_3D()
+    # for frame1, frame2 in track_iter_progress(zip(video_reader1, video_reader2), total=len(video_reader1)):
+    # for frame in track_iter_progress((video_reader, len(video_reader))):
+    pre_time = time.perf_counter()
+    while  True:
+        frame, depth_image = m3d.get_frame()
+
+        
 
         # unified models mean that masa build upon and reuse the foundation model's backbone features for tracking
         if args.unified:
@@ -198,29 +218,75 @@ def main():
         frames.append(frame)
         if args.show_fps:
             fps_list.append(fps)
+###################################################################################################################################
+        track = track_result.to('cpu')
+        
+        speed = []
+        velocity_vec = []
+        scores = track[0].pred_track_instances.scores.numpy().copy()
+        mask = scores >= 0.8
+        scores = scores[mask]
+        boxes = track[0].pred_track_instances.bboxes.numpy()
+        boxes = boxes[mask]
+        px = (boxes[:,0] + boxes[:,2])/2
+        py = (boxes[:,1] + boxes[:,3])/2
+        instance_id = track[0].pred_track_instances.instances_id.numpy()
+        instance_id = instance_id[mask]
+        mask2 = (px > 350) & (px < 1050)
+        py = py[mask2]
+        instance_id = instance_id[mask2]
+        px = px[mask2]
+        track = (instance_id,px, py)
+        curr_time = time.perf_counter()
+        time_diff = - pre_time + curr_time
+        for i, id in enumerate(instance_id, start=0):
+            X,Y,Z = m3d.pixel_to_point3d_in_cam(int(px[i]), int(py[i]), m3d.cam_real1, depth_image) # 差camera 和 depth image
+            detected[id] = (X,Y,Z)
+            if id in predetected:
+                print(True)
+                velocity_vec_, speed_ = m3d.getVelocity( predetected[id], detected[id], time_diff)
+                speed.append(speed_)
+                velocity_vec.append(velocity_vec_)
+                # calculate average speed
+        predetected = detected.copy()
+        detected.clear()
+        # velocity_vec, speed = remove_outlier(speed, velocity_vec)
+        speed = np.mean(speed)
+        velocity_vec = np.mean(velocity_vec, axis = 0)
 
+        print("\n speed is", speed)
+        print("velocity vector", velocity_vec)
+        pre_time = curr_time
+        for points in boxes:
+            pt1 = (int(points[0]),int(points[1]))
+            pt2 = (int(points[2]), int(points[3]))
+            frame = cv2.rectangle(frame,pt1,pt2,color=(0, 255, 0), thickness=2)
+        
+        cv2.imshow("img", frame)
+        cv2.waitKey(1)
+###################################################################################################################################
     if not args.no_post:
         instances_list = filter_and_update_tracks(instances_list, (frame.shape[1], frame.shape[0]))
 
-    if args.sam_mask:
-        print('Start to generate mask using SAM!')
-        for idx, (frame, track_result) in tqdm.tqdm(enumerate(zip(frames, instances_list))):
-            track_result = track_result.to(device)
-            track_result[0].pred_track_instances.instances_id = track_result[0].pred_track_instances.instances_id.to(device)
-            track_result[0].pred_track_instances = track_result[0].pred_track_instances[(track_result[0].pred_track_instances.scores.float() > args.score_thr).to(device)]
-            input_boxes = track_result[0].pred_track_instances.bboxes
-            if len(input_boxes) == 0:
-                continue
-            sam_predictor.set_image(frame)
-            transformed_boxes = sam_predictor.transform.apply_boxes_torch(input_boxes, frame.shape[:2])
-            masks, _, _ = sam_predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-            )
-            track_result[0].pred_track_instances.masks = masks.squeeze(1).cpu().numpy()
-            instances_list[idx] = track_result
+    # if args.sam_mask:
+    #     print('Start to generate mask using SAM!')
+    #     for idx, (frame, track_result) in tqdm.tqdm(enumerate(zip(frames, instances_list))):
+    #         track_result = track_result.to(device)
+    #         track_result[0].pred_track_instances.instances_id = track_result[0].pred_track_instances.instances_id.to(device)
+    #         track_result[0].pred_track_instances = track_result[0].pred_track_instances[(track_result[0].pred_track_instances.scores.float() > args.score_thr).to(device)]
+    #         input_boxes = track_result[0].pred_track_instances.bboxes
+    #         if len(input_boxes) == 0:
+    #             continue
+    #         sam_predictor.set_image(frame)
+    #         transformed_boxes = sam_predictor.transform.apply_boxes_torch(input_boxes, frame.shape[:2])
+    #         masks, _, _ = sam_predictor.predict_torch(
+    #             point_coords=None,
+    #             point_labels=None,
+    #             boxes=transformed_boxes,
+    #             multimask_output=False,
+    #         )
+    #         track_result[0].pred_track_instances.masks = masks.squeeze(1).cpu().numpy()
+    #         instances_list[idx] = track_result
 
 
 
